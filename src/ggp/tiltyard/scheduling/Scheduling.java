@@ -1,16 +1,9 @@
 package ggp.tiltyard.scheduling;
 
-import external.JSON.JSONArray;
-import external.JSON.JSONException;
-import external.JSON.JSONObject;
-import ggp.tiltyard.players.Player;
-import ggp.tiltyard.backends.Backends;
-import ggp.tiltyard.hosting.Hosting;
-import ggp.tiltyard.hosting.MatchData;
-
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -20,16 +13,30 @@ import java.util.Map;
 import java.util.Random;
 import java.util.Set;
 
-import javax.servlet.http.HttpServletResponse;
-
+import org.ggp.base.util.game.CloudGameRepository;
 import org.ggp.base.util.loader.RemoteResourceLoader;
+
+import com.google.common.collect.Sets;
+import com.googlecode.charts4j.collect.Lists;
+
+import external.JSON.JSONArray;
+import external.JSON.JSONException;
+import external.JSON.JSONObject;
+import ggp.tiltyard.backends.Backends;
+import ggp.tiltyard.hosting.Hosting;
+import ggp.tiltyard.hosting.MatchData;
+import ggp.tiltyard.players.Player;
+import net.alloyggp.tournament.api.MatchResult;
+import net.alloyggp.tournament.api.MatchSetup;
+import net.alloyggp.tournament.api.NextMatchesResult;
+import net.alloyggp.tournament.api.Seeding;
 
 public class Scheduling {
     // Eventually we should support other repository servers. Figure out how
     // to do this in a safe, secure fashion (since the repository server can
-    // inject arbitrary javascript into the visualizations).	
+    // inject arbitrary javascript into the visualizations).
 	private static final String GAME_REPO_URL = "http://games.ggp.org/base/";
-	
+
 	// This is a whitelist of games that run on Tiltyard, organized by category.
 	// This eliminates the following classes of games:
 	//
@@ -75,7 +82,7 @@ public class Scheduling {
 		new String[] { "knightThrough", "breakthroughWalls", "breakthrough",  "breakthroughSmall",
 				"escortLatch" },
 		// Dots-and-Boxes variants
-		new String[] { "dotsAndBoxes", "dotsAndBoxesSuicide" },				
+		new String[] { "dotsAndBoxes", "dotsAndBoxesSuicide" },
 		// Pentago variants
 		new String[] { "pentago", "pentagoSuicide" },
 		// Quarto variants
@@ -101,18 +108,23 @@ public class Scheduling {
 		new String[] { "futoshiki4", "futoshiki5", "futoshiki6", "queens06ug",
 				"queens08lg", "queens08ug", "queens31lg", "mineClearingSmall" },
 	};
-	
+
+    private static final long SECONDS_BEFORE_TOURNEY_TO_ABORT_MATCHES = 5 * 60; // 5 minutes
+
+    private static final long SECONDS_BEFORE_TOURNEY_TO_STOP_NEW_MATCHES = 60 * 60; // 60 minutes
+
     public static void runSchedulingRound() throws IOException {
     	SchedulerConfig theConfig = SchedulerConfig.loadConfig();
         List<Player> theAvailablePlayers = Player.loadEnabledPlayers();
         long morePlayersIn = Long.MAX_VALUE;
-        
+        Set<String> alreadyRunningTournamentMatchIds = Sets.newHashSet();
+
         {
             // Find and clear all of the completed or wedged matches. For matches
             // which are still ongoing, mark the players in those matches as busy.
         	// Also keep track of how long it will be before some are available.
         	Set<MatchData> activeMatches = MatchData.loadMatches();
-            Set<String> busyPlayerNames = new HashSet<String>();            
+            Set<String> busyPlayerNames = new HashSet<String>();
             for (MatchData activeMatch : activeMatches) {
             	List<String> matchPlayers = activeMatch.getPlayerNames();
             	if (activeMatch.isCompleted() && activeMatch.getTimeSinceLastChange() > 1000L*60*2) {
@@ -132,6 +144,10 @@ public class Scheduling {
             		// note when they'll be available for new matches.
             		busyPlayerNames.addAll(matchPlayers);
             		morePlayersIn = Math.min(activeMatch.getExpectedTimeToCompletion(), morePlayersIn);
+            		String tournamentMatchId = getTournamentMatchId(activeMatch);
+            		if (tournamentMatchId != null) {
+            		    alreadyRunningTournamentMatchIds.add(tournamentMatchId);
+            		}
             	}
             }
 
@@ -149,7 +165,7 @@ public class Scheduling {
             // we know they're in a match, or because they say they're busy, or because
             // they're disabled.
             for (int i = theAvailablePlayers.size()-1; i >= 0; i--) {
-                Player p = theAvailablePlayers.get(i);                
+                Player p = theAvailablePlayers.get(i);
                 if (!p.isEnabled() || (p.isPingable() && !("available".equals(p.getInfoStatus().toLowerCase()))) || busyPlayerNames.contains(p.getName())) {
                     theAvailablePlayers.remove(i);
                 }
@@ -160,14 +176,28 @@ public class Scheduling {
         // left to do is schedule new matches. If the backends are being drained,
         // we don't schedule any new matches.
         if (theConfig.isDrained()) return;
-        
+
         // If there are no backends available, don't schedule any new matches.
         if (Backends.loadBackends().getFarmBackendAddresses(Player.REGION_ANY).isEmpty()) return;
-        
+
+        //If a tournament is running or approaching, just run that instead of round-robin matches
+        for (TournamentData tournament : getUpcomingTournaments()) {
+            long secondsToStart = tournament.getTournament().getSecondsToWaitUntilInitialStartTime();
+            if (secondsToStart == 0L) {
+                scheduleTournamentMatches(tournament, alreadyRunningTournamentMatchIds);
+                return;
+            } else if (secondsToStart < SECONDS_BEFORE_TOURNEY_TO_ABORT_MATCHES) {
+                abortAllRunningMatches();
+                return;
+            } else if (secondsToStart < SECONDS_BEFORE_TOURNEY_TO_STOP_NEW_MATCHES) {
+                return;
+            }
+        }
+
         // Figure out how many players are available. If no computer players are
     	// available, don't bother attempting to automatically schedule a match.
         if (theAvailablePlayers.isEmpty()) return;
-        
+
         // For all of the pending matches in the scheduling queue, consider
         // running each one. These have a higher priority than the regularly
         // scheduled automatic matches. When they schedule, they will remove
@@ -175,7 +205,7 @@ public class Scheduling {
         Set<PendingMatch> pendingMatches = PendingMatch.loadPendingMatches();
     	for (PendingMatch match : pendingMatches) {
     		match.considerStarting(theAvailablePlayers);
-    	}        
+    	}
 
         // When there is only a single available player, but there are busy players,
         // and we expect one of those busy players to become available within 15 minutes,
@@ -184,11 +214,11 @@ public class Scheduling {
         if (theAvailablePlayers.size() == 1 && morePlayersIn < 15*60*1000) {
         	return;
         }
-        
+
         // Load the aggregated game metadata from the base repository server.
         int nGamesLookupAttempt = 0;
         JSONObject metadataForGames;
-        while (true) {        	
+        while (true) {
 	        try {
 	        	metadataForGames = RemoteResourceLoader.loadJSON(GAME_REPO_URL + "games/metadata");
 	            break;
@@ -203,14 +233,14 @@ public class Scheduling {
 				Thread.sleep(1000);
 			} catch (InterruptedException e1) {
 				;
-			}	        
-        }        
-        
+			}
+        }
+
         // Only allow games on a whitelist of "safe" games that the backend can handle.
         // Set<String> theSafeGames = new HashSet<String>(Arrays.asList(safeGames));
         Set<String> theSafeGames = new HashSet<String>(Arrays.asList(safeGamesByCategory[new Random().nextInt(safeGamesByCategory.length)]));
         List<String> properGameKeys = new ArrayList<String>();
-        Map<String, JSONObject> properGames = new HashMap<String, JSONObject>();        
+        Map<String, JSONObject> properGames = new HashMap<String, JSONObject>();
         Iterator<?> itr = metadataForGames.keys();
         while (itr.hasNext()) {
         	String key = itr.next().toString();
@@ -227,7 +257,7 @@ public class Scheduling {
 
         // Shuffle the list of known proper games, draw a game, and get ready to play.
         Collections.shuffle(properGameKeys);
-        String gameKey = properGameKeys.get(0);        
+        String gameKey = properGameKeys.get(0);
         int nPlayersForGame, gameVersion;
         try {
 	        nPlayersForGame = properGames.get(gameKey).getInt("numRoles");
@@ -256,14 +286,14 @@ public class Scheduling {
         	theChosenPlayers.add(null);
         }
         Collections.shuffle(theChosenPlayers);
-        
+
         // Once the final mapping of players to roles has been chosen,
         // extract the names and URLs from the players into a form that
         // will appear in the match creation request.
         List<String> playerURLsForMatch = new ArrayList<String>();
         List<String> playerNamesForMatch = new ArrayList<String>();
         List<String> playerRegionsForMatch = new ArrayList<String>();
-        for (Player p : theChosenPlayers) {        	
+        for (Player p : theChosenPlayers) {
         	if (p == null) {
         		playerURLsForMatch.add(null);
         		playerNamesForMatch.add("Random");
@@ -274,26 +304,136 @@ public class Scheduling {
         		playerRegionsForMatch.add(p.getRegion());
         	}
         }
-        
+
         // Choose randomized start clocks and play clocks for the match.
         // Start clocks vary between 150 seconds and 240 seconds.
         // Play clocks vary between 15 seconds and 45 seconds.
-        Random theRandom = new Random();        
+        Random theRandom = new Random();
         int startClock = 150 + 10*theRandom.nextInt(10);
         int playClock = 15 + 5*theRandom.nextInt(7);
         int previewClock = -1;
 
         // Start the match using the hybrid match hosting system.
-       	Hosting.startMatch(theGameURL, playerURLsForMatch, playerNamesForMatch, playerRegionsForMatch, previewClock, startClock, playClock);        	
+       	Hosting.startMatch(theGameURL, playerURLsForMatch, playerNamesForMatch, playerRegionsForMatch, previewClock, startClock, playClock);
     }
 
-    private static void handleStrikesForPlayers(JSONObject theMatchInfo, List<String> players, List<Player> thePlayers) {    	
-        if (!theMatchInfo.has("errors")) return;        
+    //Can return null if this is not a tournament-related match
+    private static String getTournamentMatchId(MatchData activeMatch) {
+        // TODO Implement
+    }
+
+    private static void scheduleTournamentMatches(TournamentData tournament, Set<String> alreadyRunningMatchIds) {
+        Seeding seeding = getInitialSeedingFor(tournament);
+        //TODO: We should load this AFTER checking the already-running matches
+        Set<MatchResult> matchResults = getMatchResultsSoFarFor(tournament);
+        NextMatchesResult matchesToRunResult = tournament.getTournament().getMatchesToRun(seeding, matchResults);
+
+        if (matchesToRunResult.getSecondsToWaitUntilAllowedStartTime() > 0L) {
+            //This round of the tournament shouldn't start yet
+            //Let a later pass of the scheduler deal with these matches
+            return;
+        }
+
+        if (matchesToRunResult.getMatchesToRun().isEmpty()) {
+            tournament.markCompleted();
+            return;
+        }
+
+        for (MatchSetup matchSetup : matchesToRunResult.getMatchesToRun()) {
+            if (alreadyRunningMatchIds.contains(matchSetup.getMatchId())) {
+                continue;
+            }
+
+            String theGameURL = getGameUrl(matchSetup.getGame());
+
+            List<String> playerURLsForMatch = Lists.newArrayList();
+            List<String> playerNamesForMatch = Lists.newArrayList();
+            List<String> playerRegionsForMatch = Lists.newArrayList();
+            for (net.alloyggp.tournament.api.Player tournamentPlayer : matchSetup.getPlayers()) {
+                Player player = Player.loadPlayer(tournamentPlayer.getId());
+                playerURLsForMatch.add(player.getURL());
+                playerNamesForMatch.add(player.getName());
+                playerRegionsForMatch.add(player.getRegion());
+            }
+            Hosting.startMatch(theGameURL,
+                    playerURLsForMatch,
+                    playerNamesForMatch,
+                    playerRegionsForMatch,
+                    -1, //previewClock
+                    matchSetup.getStartClock(),
+                    matchSetup.getPlayClock());
+        }
+    }
+
+    private static Seeding getInitialSeedingFor(TournamentData tournament) {
+        if (tournament.getPersistedSeeding() == null) {
+            List<Player> playersToInclude = getPlayersPresentForTournament();
+            List<net.alloyggp.tournament.api.Player> players = Lists.newArrayList();
+            for (Player player : playersToInclude) {
+                players.add(net.alloyggp.tournament.api.Player.create(player.getName()));
+            }
+            Seeding seeding = Seeding.createRandomSeeding(new Random(), players);
+            tournament.setPersistedSeeding(seeding.toPersistedString());
+            return seeding;
+        }
+        return Seeding.fromPersistedString(tournament.getPersistedSeeding());
+    }
+
+    private static List<Player> getPlayersPresentForTournament() {
+        // TODO Implement
+        //These are players that both are present and have checked the
+        //box on their player profile indicating they'd like to compete.
+    }
+
+    private static String getGameUrl(net.alloyggp.tournament.api.Game game) {
+        //TODO (alandau): Consider putting the game URL directly in the YAML
+        return new CloudGameRepository(game.getSource()).getGame(game.getId()).getRepositoryURL();
+    }
+
+    private static Set<MatchResult> getMatchResultsSoFarFor(TournamentData tournament) {
+        Set<MatchResult> results = Sets.newHashSet();
+        for (MatchData matchData : getMatchDataSoFarFor(tournament)) {
+            //ASSUMPTION: This will include aborted matches
+            if (matchData.isCompleted()) {
+                //TODO: Fill in these based on the matchData
+                boolean wasAborted;
+                String matchId;
+                List<net.alloyggp.tournament.api.Player> players;
+                if (wasAborted) {
+                    results.add(MatchResult.getAbortedMatchResult(matchId, players));
+                } else {
+                    List<Integer> goalValues;
+                    results.add(MatchResult.getSuccessfulMatchResult(matchId, players, goalValues));
+                }
+            }
+        }
+        return results;
+    }
+
+    private static Collection<MatchData> getMatchDataSoFarFor(TournamentData tournament) {
+        // TODO Implement
+    }
+
+    /**
+     * Returns a list of the known tournaments that have not yet
+     * been marked as completed by {@link TournamentData#markCompleted()}.
+     * This includes ongoing as well as future tournaments.
+     *
+     * The current runTournament() implementation assumes that either
+     * 1) tournaments are spaced out in time reasonably, or 2) this
+     * method returns tournaments in a consistent order.
+     */
+    private static List<TournamentData> getUpcomingTournaments() {
+        // TODO Implement
+    }
+
+    private static void handleStrikesForPlayers(JSONObject theMatchInfo, List<String> players, List<Player> thePlayers) {
+        if (!theMatchInfo.has("errors")) return;
         int[] numLegalMoves = new int[players.size()];
         for (int i = 0; i < numLegalMoves.length; i++) {
         	numLegalMoves[i] = 0;
         }
-        
+
         int numTotalMoves;
         try {
             JSONArray theErrors = theMatchInfo.getJSONArray("errors");
@@ -322,7 +462,7 @@ public class Scheduling {
             }
         }
     }
-    
+
 	public static void doPost(String theURI, String in, HttpServletResponse resp) throws IOException {
 		try {
 			if (theURI.equals("start_match")) {
@@ -342,7 +482,7 @@ public class Scheduling {
 		        int startClock = theRequest.getInt("startClock");
 		        int playClock = theRequest.getInt("playClock");
 		        int deadline = theRequest.getInt("deadline");
-		        
+
 		        // All games on Tiltyard must come from the base game repository.
 		        if (!gameURL.startsWith("http://games.ggp.org/base/games/")) {
 		        	resp.setStatus(500);
@@ -362,7 +502,7 @@ public class Scheduling {
             resp.setHeader("Access-Control-Allow-Origin", "tiltyard.ggp.org");
             resp.setHeader("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
             resp.setHeader("Access-Control-Allow-Headers", "*");
-            resp.setHeader("Access-Control-Allow-Age", "86400");        
+            resp.setHeader("Access-Control-Allow-Age", "86400");
             resp.setContentType("text/plain");
             resp.setStatus(200);
 		} catch (JSONException e) {
@@ -372,19 +512,19 @@ public class Scheduling {
 
 	public static void doGet(String reqURI, HttpServletResponse resp) {
 		if (reqURI.equals("pending")) {
-    		try {			
+    		try {
 				List<JSONObject> pendingMatchesJSON = new ArrayList<JSONObject>();
 		        Set<PendingMatch> pendingMatches = PendingMatch.loadPendingMatches();
 	        	for (PendingMatch match : pendingMatches) {
 	        			pendingMatchesJSON.add(match.toJSON());
 	        	}
 	        	JSONObject response = new JSONObject();
-	        	response.put("pending", pendingMatchesJSON);        	
+	        	response.put("pending", pendingMatchesJSON);
 	        	resp.getWriter().println(response);
 	            resp.setHeader("Access-Control-Allow-Origin", "*");
 	            resp.setHeader("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
 	            resp.setHeader("Access-Control-Allow-Headers", "*");
-	            resp.setHeader("Access-Control-Allow-Age", "86400");        
+	            resp.setHeader("Access-Control-Allow-Age", "86400");
 	            resp.setContentType("text/plain");
 	            resp.setStatus(200);
     		} catch (JSONException je) {
